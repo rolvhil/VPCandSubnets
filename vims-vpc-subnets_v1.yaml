@@ -1,0 +1,1109 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ' VPC and Subnet and Kubernetes cluster on AWS EC2 with 3 VPC CIDR and multiple network subnets'
+
+Mappings:
+  ServicePrincipals:
+    aws-cn:
+      ec2: ec2.amazonaws.com.cn
+    aws:
+      ec2: ec2.amazonaws.com
+
+Metadata:
+  "AWS::CloudFormation::Interface":
+    ParameterGroups:
+      - Label:
+          default: VPC Parameters
+        Parameters:
+          - VpcCidr
+          - EnableIPv6
+          - VpcCNI
+          - SessionDBCRDL
+          - PrivateSubnetAZ2
+          - GreTunnel
+          - EMXSignaling
+          - InternalOAM
+          - H248
+          - OAMExternal
+          - AccessSignallingMedia
+          - CoreMedia
+          - CoreSignaling
+
+      - Label:
+          default: EKS Cluster Parameters
+        Parameters:
+          - K8sVersion
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: ${VpcCidr}
+    Description: The internal CIDR range for the VPC.
+
+  VpcCidr2:
+    Type: String
+    Default: ${VpcCidr2}
+    Description: The external CIDR range for the VPC.
+  
+  VpcCidr3:
+    Type: String
+    Default: ${VpcCidr3}
+    Description: The external CIDR range for the VPC.
+
+  EnableIPv6:
+    Type: String
+    Default: true
+    Description: Enable dual stack for this VPC (true or false).
+
+  VpcCNI:
+    Type: String
+    Default: ${VpcCNI}
+    Description: Subnet for Vpc CNIis (eth0)
+
+  SessionDBCRDL:
+    Type: String
+    Default: ${SessionDBCRDL}
+    Description: Subnet for SessionDB-CRDL
+
+  PrivateSubnetAZ2:
+    Type: String
+    Default: ${PrivateSubnetAZ2}
+    Description: CIDR Block for private subnet in AZ2
+
+  GreTunnel:
+    Type: String
+    Default: ${GreTunnel}
+    Description: Subnet for GRE-Tunnel GTRE-DIAMRE-SIPRE-FE
+
+  InternalOAM:
+    Type: String
+    Default: ${InternalOAM}
+    Description: Subnet for Internal OAM
+
+  EMXSignaling:
+    Type: String
+    Default: ${EMXSignaling}
+    Description: Subnet for EMX Signaling
+
+  H248:
+    Type: String
+    Default: ${H248}
+    Description: Subnet for H248-UPC-MP-SC
+
+  OAMExternal:
+    Type: String
+    Default: ${OAMExternal}
+    Description: Subnet for OAM External
+
+  AccessSignallingMedia:
+    Type: String
+    Default: ${AccessSignallingMedia}
+    Description: Subnet for Access Signalling Media for UAG
+
+  CoreMedia:
+    Type: String
+    Default: ${CoreMedia}
+    Description: Subnet for Core Media
+
+  CoreSignaling:
+    Type: String
+    Default: ${CoreSignaling}
+    Description: Subnet for Core Signaling
+
+  TransitGatewayId:
+    Description: Transit Gateway Id
+    Type: String
+#    MinLength: '21'
+#    MaxLength: '21'
+#    AllowedPattern: "tgw-([0-9a-zA-Z0-9]{17,25})"
+    Default: ${TransitGatewayId}
+
+  K8sVersion:
+    Description: Kubernetes Version
+    Type: String
+    Default: ${K8sVersion}
+
+Conditions:
+  # Condition to enable IPv6
+  IncludeIPv6: !Equals
+    - Ref: EnableIPv6
+    - "true"
+  # EKS 1.17 and 1.18 require tags for LB to work
+  TagsRequired: !Or
+    - !Equals [!Ref K8sVersion, "1.21"]
+    - !Equals [!Ref K8sVersion, "1.22"]
+
+  Version-1-19: !Not [ Condition: TagsRequired ]
+
+  VpcCidrSecondaryExists: !Not [!Equals [!Ref VpcCidr2, "" ]]
+
+  VpcCidrThirdExists: !Not [!Equals [!Ref VpcCidr3, "" ]]
+
+
+
+Resources:
+  #############################################################################
+  # VPC, gateways, route tables
+  #############################################################################
+  # VPC, internal subnets, external subnets
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock:  !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-VPC'
+
+  2ndVPCCidr:
+    Type: AWS::EC2::VPCCidrBlock
+    Condition: VpcCidrSecondaryExists
+    Properties:
+      CidrBlock: !Ref VpcCidr2
+      #      Ipv6CidrBlock: String
+      #      Ipv6Pool: String
+      VpcId: !Ref VPC
+  
+  3rdVPCCidr:
+    Type: AWS::EC2::VPCCidrBlock
+    Condition: VpcCidrThirdExists
+    Properties:
+      CidrBlock: !Ref VpcCidr3
+      #      Ipv6CidrBlock: String
+      #      Ipv6Pool: String
+      VpcId: !Ref VPC
+
+  externalRouteTable:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-externalRouteTable'
+
+  externalRoutentry:
+    DependsOn:
+      - TransitGatewayAttachment
+      - externalRouteTable
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref externalRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      TransitGatewayId: !Ref TransitGatewayId
+
+  internalRouteTable:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-internalRouteTable'
+
+  internalRouteTableAZ2:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-internalRouteTableAZ2'
+
+  #############################################################################
+  # IPv6 specific
+  #############################################################################
+  IPv6CidrBlock:
+    Condition: IncludeIPv6
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      AmazonProvidedIpv6CidrBlock: true
+      VpcId: !Ref VPC
+
+  #############################################################################
+  # Subnets
+  # Modify as needed to fit your applications
+  #############################################################################
+
+  VPCReadyIPv6:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Metadata:
+      Ipv6CidrReady: !If [ IncludeIPv6, !Ref IPv6CidrBlock, "" ]
+
+  VPCReadySecondCIDR:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Metadata:
+      SecondaryCIDRready: !If [ VpcCidrSecondaryExists, !Ref 2ndVPCCidr, "" ]
+  
+  VPCReadyThirdCIDR:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Metadata:
+      ThirdCIDRready: !If [ VpcCidrThirdExists, !Ref 3rdVPCCidr, "" ] 
+
+  # Public subnet: Only jump server has public IP on this subnet. It is also used for
+  # external load balancer. It is on AZ 2 to meet EKS 2 AZ requirement.
+
+  SubnetPrivateSubnetAZ2:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::Subnet
+    Metadata:
+      Comment: Private subnet in AZ2
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - '1'
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      CidrBlock:
+        Ref: PrivateSubnetAZ2
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateSubnetAZ2"
+        - !If
+          - TagsRequired
+          - Key: kubernetes.io/role/internal-elb
+            Value: 1
+          - !Ref AWS::NoValue
+        - !If
+          - TagsRequired
+          - Key: !Sub "kubernetes.io/cluster/${AWS::StackName}"
+            Value: shared
+          - !Ref AWS::NoValue
+
+  SubnetVpcCNI:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::Subnet
+    Metadata:
+      Comment: Subnet for VPC CNI
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - '0'
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      CidrBlock:
+        Ref: VpcCNI
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Session-VpcCNI"
+        - !If
+          - TagsRequired
+          - Key: kubernetes.io/role/internal-elb
+            Value: 1
+          - !Ref AWS::NoValue
+        - !If
+          - TagsRequired
+          - Key: !Sub "kubernetes.io/cluster/${AWS::StackName}"
+            Value: shared
+          - !Ref AWS::NoValue
+
+  internalSubnetRouteTableAssociationVpcCNI:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetVpcCNI
+      RouteTableId: !Ref internalRouteTable
+
+  SubnetSessionDBCRDL:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::Subnet
+    Metadata:
+      Comment: Subnet for SessionDB-CRDL
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - '0'
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      CidrBlock:
+        Ref: SessionDBCRDL
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Session-DBCRDL"
+        - !If
+          - TagsRequired
+          - Key: kubernetes.io/role/internal-elb
+            Value: 1
+          - !Ref AWS::NoValue
+        - !If
+          - TagsRequired
+          - Key: !Sub "kubernetes.io/cluster/${AWS::StackName}"
+            Value: shared
+          - !Ref AWS::NoValue
+
+  internalSubnetRouteTableAssociationSessionDBCRDL:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetSessionDBCRDL
+      RouteTableId: !Ref internalRouteTable
+
+  SubnetGreTunnel:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::Subnet
+    Metadata:
+      Comment: Subnet for GRE-Tunnel GTRE-DIAMRE-SIPRE-FE
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - '0'
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      CidrBlock:
+        Ref: GreTunnel
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Gre-Tunnel"
+        - !If
+          - TagsRequired
+          - Key: kubernetes.io/role/internal-elb
+            Value: 1
+          - !Ref AWS::NoValue
+        - !If
+          - TagsRequired
+          - Key: !Sub "kubernetes.io/cluster/${AWS::StackName}"
+            Value: shared
+          - !Ref AWS::NoValue
+
+  internalSubnetRouteTableAssociationGreTunnel:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetGreTunnel
+      RouteTableId: !Ref internalRouteTable
+
+  SubnetEMXSignaling:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::Subnet
+    Metadata:
+      Comment: Subnet for EMX Signaling
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - '0'
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      CidrBlock:
+        Ref: EMXSignaling
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-EMX-Signaling"
+        - !If
+          - TagsRequired
+          - Key: kubernetes.io/role/internal-elb
+            Value: 1
+          - !Ref AWS::NoValue
+        - !If
+          - TagsRequired
+          - Key: !Sub "kubernetes.io/cluster/${AWS::StackName}"
+            Value: shared
+          - !Ref AWS::NoValue
+
+  internalSubnetRouteTableAssociationEMXSignaling:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetEMXSignaling
+      RouteTableId: !Ref internalRouteTable
+
+  SubnetInternalOAM:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::Subnet
+    Metadata:
+      Comment: Subnet for Internal OAM
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - '0'
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      CidrBlock:
+        Ref: InternalOAM
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Internal-OAM"
+        - !If
+          - TagsRequired
+          - Key: kubernetes.io/role/internal-elb
+            Value: 1
+          - !Ref AWS::NoValue
+        - !If
+          - TagsRequired
+          - Key: !Sub "kubernetes.io/cluster/${AWS::StackName}"
+            Value: shared
+          - !Ref AWS::NoValue
+
+  internalSubnetRouteTableAssociationInternalOAM:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetInternalOAM
+      RouteTableId: !Ref internalRouteTable
+
+  SubnetH248UPCMPSC:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::Subnet
+    Metadata:
+      Comment: Subnet for H248-UPC-MP-SC
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - '0'
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      CidrBlock:
+        Ref: H248
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-H248-UPC-MP-SC"
+        - !If
+          - TagsRequired
+          - Key: kubernetes.io/role/internal-elb
+            Value: 1
+          - !Ref AWS::NoValue
+        - !If
+          - TagsRequired
+          - Key: !Sub "kubernetes.io/cluster/${AWS::StackName}"
+            Value: shared
+          - !Ref AWS::NoValue
+
+  internalSubnetRouteTableAssociationH248:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetH248UPCMPSC
+      RouteTableId: !Ref internalRouteTable
+
+  SubnetOAMExternal:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::Subnet
+    Metadata:
+      Comment: Subnet for OAM External
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - '0'
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      CidrBlock:
+        Ref: OAMExternal
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-OAM-External"
+        - !If
+          - TagsRequired
+          - Key: kubernetes.io/role/internal-elb
+            Value: 1
+          - !Ref AWS::NoValue
+        - !If
+          - TagsRequired
+          - Key: !Sub "kubernetes.io/cluster/${AWS::StackName}"
+            Value: shared
+          - !Ref AWS::NoValue
+
+  externalSubnetRouteTableAssociationOAMExternal:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetOAMExternal
+      RouteTableId: !Ref externalRouteTable
+
+  SubnetAccessSignallingMedia:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::Subnet
+    Metadata:
+      Comment: Subnet for Access Signalling Media for UAG
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - '0'
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      CidrBlock:
+        Ref: AccessSignallingMedia
+      Ipv6CidrBlock: !If
+        - IncludeIPv6
+        - !Select [8, !Cidr [!Select [0, !GetAtt VPC.Ipv6CidrBlocks], 16, 64]]
+        - !Ref AWS::NoValue
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-AccessSignallingMediaforUAG"
+        - !If
+          - TagsRequired
+          - Key: kubernetes.io/role/internal-elb
+            Value: 1
+          - !Ref AWS::NoValue
+        - !If
+          - TagsRequired
+          - Key: !Sub "kubernetes.io/cluster/${AWS::StackName}"
+            Value: shared
+          - !Ref AWS::NoValue
+
+  externalSubnetRouteTableAssociationAccessSignallingMediaforUAG:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetAccessSignallingMedia
+      RouteTableId: !Ref externalRouteTable
+
+  SubnetCoreMedia:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::Subnet
+    Metadata:
+      Comment: Subnet for Core Media
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - '0'
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      CidrBlock:
+        Ref: CoreMedia
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Core-Media"
+        - !If
+          - TagsRequired
+          - Key: kubernetes.io/role/internal-elb
+            Value: 1
+          - !Ref AWS::NoValue
+        - !If
+          - TagsRequired
+          - Key: !Sub "kubernetes.io/cluster/${AWS::StackName}"
+            Value: shared
+          - !Ref AWS::NoValue
+
+  externalSubnetRouteTableAssociationCoreMedia:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetCoreMedia
+      RouteTableId: !Ref externalRouteTable
+
+  SubnetCoreSignaling:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::Subnet
+    Metadata:
+      Comment: Subnet for Core Signaling
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - '0'
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      CidrBlock:
+        Ref: CoreSignaling
+      Ipv6CidrBlock: !If
+        - IncludeIPv6
+        - !Select [9, !Cidr [!Select [0, !GetAtt VPC.Ipv6CidrBlocks], 16, 64]]
+        - !Ref AWS::NoValue
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Core-Signaling"
+        - !If
+          - TagsRequired
+          - Key: kubernetes.io/role/internal-elb
+            Value: 1
+          - !Ref AWS::NoValue
+        - !If
+          - TagsRequired
+          - Key: !Sub "kubernetes.io/cluster/${AWS::StackName}"
+            Value: shared
+          - !Ref AWS::NoValue
+
+  externalSubnetRouteTableAssociationCoreSignaling:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetCoreSignaling
+      RouteTableId: !Ref externalRouteTable
+
+  TransitGatewayAttachment:
+    DependsOn:
+      - SubnetCoreSignaling
+      - SubnetPrivateSubnetAZ2
+    Type: AWS::EC2::TransitGatewayAttachment
+    Properties:
+      SubnetIds:
+        - !Ref SubnetCoreSignaling
+      #  - !Ref SubnetPrivateSubnetAZ2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-TransitGatewayAttachment'
+      TransitGatewayId: !Ref TransitGatewayId
+      VpcId: !Ref VPC
+
+  #############################################################################
+  # Security Groups to allow inbound traffic. Modify if needed to fit your
+  # applications
+  #############################################################################
+  # Security group used to access jump server
+  OamSecurityGroup:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: OAM security group
+      GroupDescription: Enable SSH access via port 22 inside the VPC
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - CidrIp: !Ref VpcCidr
+          IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+        - !If
+          - IncludeIPv6
+          - CidrIpv6: !Select [ 0, !GetAtt VPC.Ipv6CidrBlocks ]
+            IpProtocol: -1
+            FromPort: 0
+            ToPort: 65535
+          - !Ref AWS::NoValue
+        - CidrIp: !Ref VpcCidr2
+          IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+        - CidrIp: !Ref VpcCidr3
+          IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-OamSecurityGroup"
+        - !If
+          - TagsRequired
+          - Key: !Sub "kubernetes.io/cluster/${AWS::StackName}"
+            Value: shared
+          - !Ref AWS::NoValue
+
+  # Security group for private subnet
+  SubnetSecurityGroup:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: Private subnet security group
+      GroupDescription: Allows VPC traffic
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - CidrIp: !Ref VpcCidr
+          IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+        - !If
+          - IncludeIPv6
+          - CidrIpv6: !Select [ 0, !GetAtt VPC.Ipv6CidrBlocks ]
+            IpProtocol: -1
+            FromPort: 0
+            ToPort: 65535
+          - !Ref AWS::NoValue
+        - CidrIp: !Ref VpcCidr2
+          IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+        - CidrIp: !Ref VpcCidr3
+          IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateSubnetSecurityGroup"
+        - !If
+          - TagsRequired
+          - Key: !Sub "kubernetes.io/cluster/${AWS::StackName}"
+            Value: shared
+          - !Ref AWS::NoValue
+
+  # Security group used for Interface VPC Endpoints
+  VpcEndpointsSecurityGroup:
+    DependsOn:
+      - VPCReadyIPv6
+      - VPCReadySecondCIDR
+      - VPCReadyThirdCIDR
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: VPC Endpoints security group
+      GroupDescription: Allows HTTPS traffic
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        #        - CidrIp: 0.0.0.0/0
+        #          IpProtocol: tcp
+        #          FromPort: 443
+        #          ToPort: 443
+        #        - !If
+        #          - IncludeIPv6
+        #          - CidrIpv6: ::/0
+        #            IpProtocol: tcp
+        #            FromPort: 443
+        #            ToPort: 443
+        #          - !Ref AWS::NoValue
+        - CidrIp: !Ref VpcCidr
+          IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+        - !If
+          - IncludeIPv6
+          - CidrIpv6: !Select [ 0, !GetAtt VPC.Ipv6CidrBlocks ]
+            IpProtocol: -1
+            FromPort: 0
+            ToPort: 65535
+          - !Ref AWS::NoValue
+        - CidrIp: !Ref VpcCidr2
+          IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+        - CidrIp: !Ref VpcCidr3
+          IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-VpcEndpointsSecurityGroup"
+
+  #############################################################################
+  # Interface VPC Endpoints for platform to communicate with AWS API controller
+  # ec2, s3, ecr.dkr, ecr.api, autoscaling, elasticloadbalancing, and kms
+  # Most likely there is no need to modify this section
+  #############################################################################
+  Ec2VpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref VpcEndpointsSecurityGroup
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2
+      SubnetIds:
+        - !Ref SubnetSessionDBCRDL
+        - !Ref SubnetPrivateSubnetAZ2
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+
+  EcrApiVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref VpcEndpointsSecurityGroup
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      SubnetIds:
+        - !Ref SubnetSessionDBCRDL
+        - !Ref SubnetPrivateSubnetAZ2
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+
+  EcrDkrVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref VpcEndpointsSecurityGroup
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      SubnetIds:
+        - !Ref SubnetSessionDBCRDL
+        - !Ref SubnetPrivateSubnetAZ2
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+
+  S3VpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      RouteTableIds:
+        - Ref: externalRouteTable
+        - Ref: internalRouteTable
+        - Ref: internalRouteTableAZ2
+      VpcEndpointType: Gateway
+      VpcId: !Ref VPC
+
+  LogsVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref VpcEndpointsSecurityGroup
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      SubnetIds:
+        - !Ref SubnetSessionDBCRDL
+        - !Ref SubnetPrivateSubnetAZ2
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+
+  StsVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref VpcEndpointsSecurityGroup
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.sts
+      SubnetIds:
+        - !Ref SubnetSessionDBCRDL
+        - !Ref SubnetPrivateSubnetAZ2
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+
+  ElasticLoadBalancingVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref VpcEndpointsSecurityGroup
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.elasticloadbalancing
+      SubnetIds:
+        - !Ref SubnetSessionDBCRDL
+        - !Ref SubnetPrivateSubnetAZ2
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+
+  AutoscalingVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref VpcEndpointsSecurityGroup
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.autoscaling
+      SubnetIds:
+        - !Ref SubnetSessionDBCRDL
+        - !Ref SubnetPrivateSubnetAZ2
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+  
+  ssmVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref VpcEndpointsSecurityGroup
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      SubnetIds:
+        - !Ref SubnetSessionDBCRDL
+        - !Ref SubnetPrivateSubnetAZ2
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+  
+  ssmmessagesVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref VpcEndpointsSecurityGroup
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      SubnetIds:
+        - !Ref SubnetSessionDBCRDL
+        - !Ref SubnetPrivateSubnetAZ2
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC 
+  
+  ec2messagesVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref VpcEndpointsSecurityGroup
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      SubnetIds:
+        - !Ref SubnetSessionDBCRDL
+        - !Ref SubnetPrivateSubnetAZ2
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC 
+  
+  kmsVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref VpcEndpointsSecurityGroup
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.kms
+      SubnetIds:
+        - !Ref SubnetSessionDBCRDL
+        - !Ref SubnetPrivateSubnetAZ2
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC   
+
+Outputs:
+  VpcId:
+    Description: The VPC Id
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VPC"
+
+  VpcIpv4Cidr:
+    Description: The VPC IPv4 CIDR
+    Value: !Ref VpcCidr
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcIpv4Cidr"
+
+  VpcCidr2:
+    Description: The 2nd VPC IPv4 CIDR
+    Value: !Ref VpcCidr2
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcCidr2"
+  
+  VpcCidr3:
+    Description: The 3rd VPC IPv4 CIDR
+    Value: !Ref VpcCidr3
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcCidr3"
+
+  VpcIpv6Cidr:
+    Description: The VPC IPv6 CIDR
+    Value: !Join [ ",", !GetAtt VPC.Ipv6CidrBlocks ]
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcIpv6Cidr"
+    Condition: IncludeIPv6
+
+  K8sVersion:
+    Description: Kubernetes Version
+    Value: !Ref K8sVersion
+    Export:
+      Name: !Sub "${AWS::StackName}-K8sVersion"
+
+  SessionVpcCNI:
+    Description: Subnet for Session-VpcCNI
+    Value: !Ref SubnetVpcCNI
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcCNI"
+
+  SessionDBCRDL:
+    Description: Subnet for Session-DBCRDL
+    Value: !Ref SubnetSessionDBCRDL
+    Export:
+      Name: !Sub "${AWS::StackName}-SessionDBCRDL"
+
+  GreTunnel:
+    Description: Subnet Gre-Tunnel
+    Value: !Ref SubnetGreTunnel
+    Export:
+      Name: !Sub "${AWS::StackName}-GreTunnel"
+
+  EMXSignaling:
+    Description:  Subnet EMX-Signaling
+    Value: !Ref SubnetEMXSignaling
+    Export:
+      Name: !Sub "${AWS::StackName}-EMXSignaling"
+
+  InternalOAM:
+    Description: Subnet Internal-OAM
+    Value: !Ref SubnetInternalOAM
+    Export:
+      Name: !Sub "${AWS::StackName}-InternalOAM"
+
+  H248UPCMPSC:
+    Description: Private H248-UPC-MP-SC
+    Value: !Ref SubnetH248UPCMPSC
+    Export:
+      Name: !Sub "${AWS::StackName}-H248UPCMPSC"
+
+  OAMExternal:
+    Description: Subnet for OAM-External
+    Value: !Ref SubnetOAMExternal
+    Export:
+      Name: !Sub "${AWS::StackName}-OAMExternal"
+
+  AccessSignallingMedia:
+    Description: Subnet for Access-Signalling-MediaforUAG
+    Value: !Ref SubnetAccessSignallingMedia
+    Export:
+      Name: !Sub "${AWS::StackName}-Access-SignallingMediaforUAG"
+
+  PrivateSubnet3CidrIpv6:
+    Description: Subnet for Access-Signalling-MediaforUAGi IPv6
+    Value: !Join [ ",", !GetAtt SubnetAccessSignallingMedia.Ipv6CidrBlocks ]
+    Condition: IncludeIPv6
+    Export:
+      Name: !Sub "${AWS::StackName}-AccessSignallingMediaforUAGIpv6"
+
+  CoreMedia:
+    Description: Subnet for Core-Media
+    Value: !Ref SubnetCoreMedia
+    Export:
+      Name: !Sub "${AWS::StackName}-CoreMedia"
+
+  PrivateSubnetAZ2:
+    Description: Subnet for AZ2
+    Value: !Ref SubnetPrivateSubnetAZ2
+    Export:
+      Name: !Sub "${AWS::StackName}-SubnetPrivateSubnetAZ2"
+
+  CoreSignaling:
+    Description: Subnet for Core-Signaling
+    Value: !Ref SubnetCoreSignaling
+    Export:
+      Name: !Sub "${AWS::StackName}-CoreSignaling"
+
+  PrivateSubnetSecurityGroupId:
+    Description: Multus private subnet security group Id
+    Value: !Ref SubnetSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateSubnetSecurityGroup"
+
+  #EKSClusterSubnets:
+  #Description: Subnets used by cluster
+  #Value: !Join [ ',', [!Ref SubnetSessionDBCRDL, !Ref SubnetPrivateSubnetAZ2] ]
+  #Export:
+  #Name: !Sub "${AWS::StackName}-EKSClusterSubnets"
+  
+  EKSClusterSubnet:
+   Description: Subnets used by cluster
+   Value: !Join [ ',', [!Ref SubnetVpcCNI, !Ref SubnetInternalOAM, !Ref SubnetOAMExternal, !Ref SubnetPrivateSubnetAZ2, !Ref SubnetSessionDBCRDL, !Ref SubnetAccessSignallingMedia, !Ref SubnetCoreMedia, !Ref SubnetCoreSignaling, !Ref SubnetEMXSignaling, !Ref SubnetGreTunnel, !Ref SubnetH248UPCMPSC ] ]
+   Export:
+     Name: !Sub "${AWS::StackName}-EKSClusterSubnet"
+
+
